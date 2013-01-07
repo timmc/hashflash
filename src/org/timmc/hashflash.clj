@@ -2,7 +2,7 @@
   (:require [org.timmc.geohash :as gh]
             [clojure.string :as str])
   (:use [taoensso.timbre :as timbre :only (trace debug info warn error fatal)])
-  (:import (javax.mail Session Store Folder Message)
+  (:import (javax.mail Session Store Folder Message SendFailedException)
            (javax.mail.internet MimeMessage)
            (java.util.concurrent Executors TimeUnit)
            (java.util.regex Pattern)
@@ -13,27 +13,47 @@
 
 (timbre/set-level! :debug)
 
-;; TODO: Reply to original message (for threading)
-
 ;;;; Mail
 
 (def mail-session-properties
   (doto (java.util.Properties.)
     (.putAll {"mail.mime.address.strict" "true"})))
 
-(defn get-store
-  [imap-domain username password]
-  (doto (-> (Session/getInstance mail-session-properties)
-            (.getStore "imaps"))
-    (.connect imap-domain username password)))
+(defn get-inbox
+  "Set up and return an open inbox."
+  [config]
+  (let [store (doto (-> (Session/getInstance mail-session-properties)
+                        (.getStore "imaps"))
+                (.connect (:imap-domain config)
+                          (:username config)
+                          (:password config)))]
+    (let [inbox (.getFolder store (:source-folder config))]
+      ;; create destinations if necessary
+      (doseq [fname ((juxt :reject-folder :done-folder :sent-folder) config)]
+        (.create (.getFolder store fname) javax.mail.Folder/HOLDS_MESSAGES))
+      (.open inbox Folder/READ_WRITE)
+      inbox)))
 
-(defn close-store
-  [store]
-  (.close store))
+(defn close-inbox
+  [inbox]
+  (when (.isOpen inbox)
+    (.close inbox false))
+  (.close (.getStore inbox)))
 
 (defn send-msg
-  [m]
-  )
+  [m config]
+  (let [session (Session/getInstance mail-session-properties)
+        transport (doto (.getTransport session "smtps")
+                    (.connect (:smtp-domain config)
+                              (:smtp-port config)
+                              (:username config)
+                              (:password config)))]
+    (try
+      (.sendMessage transport m (.getRecipients m AddrType/TO))
+      true
+      (catch SendFailedException sfe
+        false)
+      (finally (.close transport)))))
 
 (defn move-to
   [msg folder-name]
@@ -144,63 +164,54 @@ This function will make network calls."
       (.setText (geohash-response! query))
       (.setHeader "References" old-msgid)
       (.setHeader "In-Reply-To" old-msgid)
+      (.setHeader "X-Mailer", "org.timmc/hashflash")
+      (.setSentDate (java.util.Date.))
       (.saveChanges))))
 
 (defn do-message
   "Handle message and return destination folder name."
   [m config]
   (if-let [query (extract-query m)]
+    (debug "Received query:" query)
     (let [response (build-reply query m)]
       ;; Mark as sent before sending -- if sending fails, we'll notice and
       ;; flag it on the next iteration.
       (.setFlag m FLAG/ANSWERED true)
-      (send-msg response)
+      (info "Sending response.")
+      (when-not (send-msg response config)
+        (warn "Failed to send response. Flagged.")
+        (.setFlag m FLAG/FLAGGED true))
       (move-to m (:done-folder config)))
     (move-to m (:reject-folder config))))
 
 (defn check-messages
-  [fldr config]
-  (debug "Checking for new messages...")
-  (let [msgs (.getMessages fldr)]
-    (info "New messages found:" (count msgs))
-    (doseq [m msgs
-            ;; Ignore flagged emssages -- these need dev attention.
-            :when (not (.isSet m FLAG/FLAGGED))]
-      (debug "Message ID:" (seq (.getHeader m "Message-ID")))
-      ;; TODO: rate-limiting
-      (if (.isSet m FLAG/ANSWERED)
-        (do (warn "Flagging lingering message.")
-            (.setFlag m FLAG/FLAGGED true))
-        (do-message m config)))))
+  [config]
+  (let [inbox (get-inbox config)]
+    (try
+      (debug "Checking for new messages...")
+      (let [msgs (.getMessages inbox)]
+        (info "New messages found:" (count msgs))
+        (doseq [m msgs
+                ;; Ignore flagged messages -- these need dev attention.
+                :when (not (.isSet m FLAG/FLAGGED))]
+          (debug "Message ID:" (seq (.getHeader m "Message-ID")))
+          ;; TODO: rate-limiting
+          (if (.isSet m FLAG/ANSWERED)
+            (do (warn "Flagging lingering message.")
+                (.setFlag m FLAG/FLAGGED true))
+            (do-message m config))))
+      (finally (close-inbox inbox)))))
 
 ;;;; Coordination
-
-(defn on-shutdown
-  "Schedule a shutdown hook."
-  [thunk]
-  (.addShutdownHook (Runtime/getRuntime) (Thread. thunk)))
-
-(defn setup
-  "Set up and return an open inbox."
-  [config]
-  (let [store (apply get-store ((juxt :imap-domain :username :password)
-                                config))]
-    (on-shutdown #(close-store store))
-    (let [inbox (.getFolder store (:source-folder config))]
-      (on-shutdown #(when (.isOpen inbox) (.close inbox)))
-      ;; create destinations if necessary
-      (doseq [fname ((juxt :reject-folder :done-folder :sent-folder) config)]
-        (.create (.getFolder store fname) javax.mail.Folder/HOLDS_MESSAGES))
-      (.open inbox Folder/READ_WRITE)
-      inbox)))
 
 (defn -main
   [& args]
   (let [config (binding [*read-eval* false]
-                 (read-string (slurp (first args))))
-        inbox (setup config)]
-    ;; start main loop
+                 (read-string (slurp (first args))))]
+    ;; kick off main loop
     (let [executor (Executors/newScheduledThreadPool 1)]
-      (on-shutdown #(.shutdown executor))
-      (-> executor (.scheduleWithFixedDelay #(check-messages inbox config)
-                                            0 1 TimeUnit/MINUTES)))))
+      (.addShutdownHook (Runtime/getRuntime) (Thread. #(.shutdown executor)))
+      (-> executor (.scheduleWithFixedDelay #(check-messages config)
+                                            0 1 TimeUnit/MINUTES))))
+  ;; don't print a return value
+  nil)
