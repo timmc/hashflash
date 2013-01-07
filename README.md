@@ -20,7 +20,8 @@ A config file looks like this:
  :password "locative2"
  :source-folder "Inbox"
  :reject-folder "rejected"
- :done-folder "answered"}
+ :done-folder "answered"
+ :log-level :info}
 ```
 
 Because IMAP implementations vary quite a bit (\*cough\* Google \*cough\*),

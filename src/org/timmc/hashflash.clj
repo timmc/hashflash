@@ -11,8 +11,6 @@
 (.importClass *ns* 'FLAG javax.mail.Flags$Flag)
 (.importClass *ns* 'AddrType javax.mail.Message$RecipientType)
 
-(timbre/set-level! :info)
-
 ;;;; Mail
 
 (def mail-session-properties
@@ -76,9 +74,11 @@
                            match-date match-coord match-coord)))
 
 (defn parse-body
-  "Return {:date LocalDate, :lat double, :lon double} or nil"
+  "Return one of the following inquiry types, or nil:
+* {:type :geohash, :date LocalDate, :lat double, :lon double}
+* {:type :usage}"
   [s]
-  (when-let [[_ y m d lats latm lons lonm] (re-find match-inquiry s)]
+  (if-let [[_ y m d lats latm lons lonm] (re-find match-inquiry s)]
     (try
       {:date (LocalDate. (Long/parseLong y)
                          (Long/parseLong m)
@@ -90,7 +90,11 @@
       (catch NumberFormatException nfe
         (info "Failed to parse a number."))
       (catch org.joda.time.IllegalFieldValueException ifve
-        (info "Invalid date.")))))
+        (info "Invalid date.")))
+    ;; OK, let's try some other things...
+    (if (re-find #"(?i)\busage\b" s)
+      {:type :usage}
+      nil)))
 
 (def djia-source-url-format
   "http://geo.crox.net/djia/%s")
@@ -141,7 +145,7 @@
         val (* 60 (rem val 1))
         m (int (quot val 1))
         s (* 60 (rem val 1))]
-    (format "%s%d\u00b0%d'%.3f\"" dirsym d m s)))
+    (format "%s %d %d' %.3f\"" dirsym d m s)))
 
 (defn geohash-response!
   "Produce a string suitable for use as an SMS response to a geohash query.
@@ -159,20 +163,33 @@ This function will make network calls."
                         ["%s, %s" (dms olat :lat) (dms olon :lon)]
                         ["DJIA = %s (from %s)" djia (.print df ddate)]]))))))
 
-(defn build-reply
-  [query oldm]
+(defn basic-response
+  [oldm txt]
   (let [session (Session/getInstance mail-session-properties)
         from (first (.getFrom oldm))
         old-msgid (.getMessageID oldm)]
     (doto (MimeMessage. session)
       (.addRecipients AddrType/TO (into-array [from]))
-      (.setSubject (str "Re: " (.getSubject oldm)))
-      (.setText (geohash-response! query))
+      (.setSubject "Geohash inquiry" "US-ASCII")
+      (.setText txt "US-ASCII")
       (.setHeader "References" old-msgid)
       (.setHeader "In-Reply-To" old-msgid)
       (.setHeader "X-Mailer", "org.timmc/hashflash")
       (.setSentDate (java.util.Date.))
       (.saveChanges))))
+
+(defn geohash-reply
+  [query oldm]
+  (basic-response oldm (geohash-response! query)))
+
+(defn usage-reply
+  [query oldm]
+  (basic-response oldm "Send a message like this:\n2012-3-15 42 -71"))
+
+(defn build-reply
+  [query oldm]
+  ((-> query :type {:geohash geohash-reply, :usage usage-reply})
+   query oldm))
 
 (defn do-message
   "Handle message and return destination folder name."
@@ -180,8 +197,8 @@ This function will make network calls."
   (if-let [query (extract-query m)]
     (let [response (build-reply query m)]
       (debug "Received query:" query)
-      ;; Mark as sent before sending -- if sending fails, we'll notice and
-      ;; flag it on the next iteration.
+      ;; Mark as sent before sending -- if sending fails horribly,
+      ;; we'll notice and flag it on the next iteration.
       (.setFlag m FLAG/ANSWERED true)
       (info "Sending response.")
       (when-not (send-msg response config)
@@ -190,13 +207,22 @@ This function will make network calls."
       (move-to m (:done-folder config)))
     (move-to m (:reject-folder config))))
 
+(defonce request-reprocess (atom false))
+
 (defn check-messages
   [config]
   (let [inbox (get-inbox config)]
     (try
       (debug "Checking for new messages...")
       (let [msgs (.getMessages inbox)]
-        (when-not (zero? (count msgs))
+        (when @request-reprocess
+          (trace "Reprocessing.")
+          (doseq [m msgs]
+            (.setFlag m FLAG/FLAGGED false)
+            (.setFlag m FLAG/ANSWERED false))
+          (reset! request-reprocess false))
+        (if (zero? (count msgs))
+          (debug "No new messages.")
           (info "New messages found:" (count msgs)))
         (doseq [m msgs
                 ;; Ignore flagged messages -- these need dev attention.
@@ -211,18 +237,35 @@ This function will make network calls."
 
 ;;;; Coordination
 
+(defonce threadpool (atom nil))
+
+(defn schedule-worker
+  [config]
+  (trace "Stopping existing worker")
+  (when-let [tp @threadpool]
+    (.shutdown tp))
+  (trace "Starting worker")
+  (let [executor (Executors/newScheduledThreadPool 1)]
+    (reset! threadpool executor)
+    (-> executor (.scheduleWithFixedDelay
+                  #(try (check-messages config)
+                        (catch Exception e
+                          (fatal e "Worker died with exception")
+                          (throw (RuntimeException. e))))
+                  0 1 TimeUnit/MINUTES))))
+
 (defn -main
   [& args]
+  (when (zero? (count args))
+    (println "Please specify a config file as the first argument.")
+    (System/exit 1))
   (let [config (binding [*read-eval* false]
                  (read-string (slurp (first args))))]
+    (timbre/set-level! (get config :log-level :info))
+    (.addShutdownHook (Runtime/getRuntime)
+                      (Thread. #(when-let [tp @threadpool]
+                                  (.shutdown tp))))
     ;; kick off main loop
-    (let [executor (Executors/newScheduledThreadPool 1)]
-      (.addShutdownHook (Runtime/getRuntime) (Thread. #(.shutdown executor)))
-      (-> executor (.scheduleWithFixedDelay
-                    #(try (check-messages config)
-                          (catch Exception e
-                            (.printStackTrace e)
-                            (throw (RuntimeException. e))))
-                    0 1 TimeUnit/MINUTES))))
+    (schedule-worker config))
   ;; don't print a return value
   nil)

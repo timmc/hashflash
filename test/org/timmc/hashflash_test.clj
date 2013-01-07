@@ -27,15 +27,15 @@
       (is (= (get-djia (LocalDate. 2008 3 25)) nil)))))
 
 (deftest formatting
-  (is (= (dms 42.3851 :lat) "N42°23'6.360\""))
-  (is (= (dms -0.0 :lon) "W0°0'0.000\""))
+  (is (= (dms 42.3851 :lat) "N 42 23' 6.360\""))
+  (is (= (dms -0.0 :lon) "W 0 0' 0.000\""))
   (with-redefs [get-djia (constantly "12948.96")])
   (is (= (geohash-response! {:lat -43.0 :lon 146.0
                              :date (LocalDate. 2012 12 6)})
          "Geohash for 2012-12-06
 -43.416328, 146.995790
 or
-S43°24'58.783\", E146°59'44.843\"
+S 43 24' 58.783\", E 146 59' 44.843\"
 DJIA = 12948.96 (from 2012-12-05)")))
 
 (deftest parsing
