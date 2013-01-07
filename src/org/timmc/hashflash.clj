@@ -2,13 +2,14 @@
   (:require [org.timmc.geohash :as gh]
             [clojure.string :as str])
   (:use [taoensso.timbre :as timbre :only (trace debug info warn error fatal)])
-  (:import (javax.mail Session Store Folder Message Flags$Flag)
+  (:import (javax.mail Session Store Folder Message)
            (javax.mail.internet MimeMessage)
            (java.util.concurrent Executors TimeUnit)
            (java.util.regex Pattern)
            (org.joda.time LocalDate)
            (org.joda.time.format DateTimeFormat)))
-(.importClass *ns* 'FLAG Flags$Flag)
+(.importClass *ns* 'FLAG javax.mail.Flags$Flag)
+(.importClass *ns* 'AddrType javax.mail.Message$RecipientType)
 
 (timbre/set-level! :debug)
 
@@ -38,18 +39,16 @@
   [msg folder-name]
   (debug "Moving message to folder:" folder-name)
   (.setFlag msg FLAG/SEEN true)
-  (.saveChanges msg)
   (let [dest (-> msg (.getFolder) (.getStore) (.getFolder folder-name))]
-    (.appendMessages dest (into-array msg))
-    (.setFlag msg FLAG/DELETED true)
-    (.saveChanges msg)))
+    (.appendMessages dest (into-array [msg]))
+    (.setFlag msg FLAG/DELETED true)))
 
 ;;;; Worker thread
 
 (def ^:private match-date #"([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})")
 (def ^:private match-coord #"(-?)([0-9]{1,3})(?:\.[0-9]*)?")
 (def match-inquiry
-  (Pattern/compile (format "^(?s)\\s+%s %s,? %s"
+  (Pattern/compile (format "^(?s)\\s*%s %s[, ]{1,2}%s"
                            match-date match-coord match-coord)))
 
 (defn parse-body
@@ -122,22 +121,30 @@
   "Produce a string suitable for use as an SMS response to a geohash query.
 This function will make network calls."
   [{:keys [lat lon date]}]
-  (if-let [djia (get-djia (gh/dow-date lat lon date))]
-    (let [[olat olon] (gh/geohash lat lon date djia)]
-      (str/join "\n"
-                (map (partial apply format)
-                     [["Geohash for %s" (.toString date "yyyy-MM-dd")]
-                      ["%.6f, %.6f" olat olon]
-                      ["or"]
-                      ["%s, %s" (dms olat :lat) (dms olon :lon)]])))))
+  (let [ddate (gh/dow-date lat lon date)
+        df (DateTimeFormat/forPattern "yyyy-MM-dd")]
+    (if-let [djia (get-djia ddate)]
+      (let [[olat olon] (gh/geohash lat lon date djia)]
+        (str/join "\n"
+                  (map (partial apply format)
+                       [["Geohash for %s" (.print df date)]
+                        ["%.6f, %.6f" olat olon]
+                        ["or"]
+                        ["%s, %s" (dms olat :lat) (dms olon :lon)]
+                        ["DJIA = %s (from %s)" djia (.print df ddate)]]))))))
 
 (defn build-reply
   [query oldm]
-  (let [session (Session/getInstance mail-session-properties)]
+  (let [session (Session/getInstance mail-session-properties)
+        from (first (.getFrom oldm))
+        old-msgid (.getMessageID oldm)]
     (doto (MimeMessage. session)
+      (.addRecipients AddrType/TO (into-array [from]))
       (.setSubject (str "Re: " (.getSubject oldm)))
-      (.setContent (geohash-response! query))
-      )))
+      (.setText (geohash-response! query))
+      (.setHeader "References" old-msgid)
+      (.setHeader "In-Reply-To" old-msgid)
+      (.saveChanges))))
 
 (defn do-message
   "Handle message and return destination folder name."
@@ -147,7 +154,6 @@ This function will make network calls."
       ;; Mark as sent before sending -- if sending fails, we'll notice and
       ;; flag it on the next iteration.
       (.setFlag m FLAG/ANSWERED true)
-      (.saveChanges m)
       (send-msg response)
       (move-to m (:done-folder config)))
     (move-to m (:reject-folder config))))
@@ -164,28 +170,37 @@ This function will make network calls."
       ;; TODO: rate-limiting
       (if (.isSet m FLAG/ANSWERED)
         (do (warn "Flagging lingering message.")
-            (.setFlag m FLAG/FLAGGED true)
-            (.saveChanges m))
+            (.setFlag m FLAG/FLAGGED true))
         (do-message m config)))))
 
 ;;;; Coordination
+
+(defn on-shutdown
+  "Schedule a shutdown hook."
+  [thunk]
+  (.addShutdownHook (Runtime/getRuntime) (Thread. thunk)))
+
+(defn setup
+  "Set up and return an open inbox."
+  [config]
+  (let [store (apply get-store ((juxt :imap-domain :username :password)
+                                config))]
+    (on-shutdown #(close-store store))
+    (let [inbox (.getFolder store (:source-folder config))]
+      (on-shutdown #(when (.isOpen inbox) (.close inbox)))
+      ;; create destinations if necessary
+      (doseq [fname ((juxt :reject-folder :done-folder :sent-folder) config)]
+        (.create (.getFolder store fname) javax.mail.Folder/HOLDS_MESSAGES))
+      (.open inbox Folder/READ_WRITE)
+      inbox)))
 
 (defn -main
   [& args]
   (let [config (binding [*read-eval* false]
                  (read-string (slurp (first args))))
-        store (apply get-store ((juxt :imap-domain :username :password)
-                                config))
-        runtime (Runtime/getRuntime)]
-    (.addShutdownHook runtime #(close-store store))
-    (let [inbox (.getFolder store (:source-folder config))]
-      (.addShutdownHook runtime #(when (.isOpen inbox) (.close inbox)))
-      ;; create destinations if necessary
-      (doseq [fname ((juxt :reject-folder :done-folder :sent-folder) config)]
-        (.create (.getFolder store fname) javax.mail.Folder/HOLDS_MESSAGES))
-      (.open inbox Folder/READ_WRITE)
-      ;; start main loop
-      (let [executor (Executors/newScheduledThreadPool 1)]
-        (.addShutdownHook runtime #(.shutdown executor))
-        (-> executor (.scheduleWithFixedDelay #(check-messages inbox config)
-                                              0 1 TimeUnit/MINUTES))))))
+        inbox (setup config)]
+    ;; start main loop
+    (let [executor (Executors/newScheduledThreadPool 1)]
+      (on-shutdown #(.shutdown executor))
+      (-> executor (.scheduleWithFixedDelay #(check-messages inbox config)
+                                            0 1 TimeUnit/MINUTES)))))
