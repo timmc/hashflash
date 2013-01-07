@@ -11,7 +11,7 @@
 (.importClass *ns* 'FLAG javax.mail.Flags$Flag)
 (.importClass *ns* 'AddrType javax.mail.Message$RecipientType)
 
-(timbre/set-level! :debug)
+(timbre/set-level! :info)
 
 ;;;; Mail
 
@@ -22,16 +22,20 @@
 (defn get-inbox
   "Set up and return an open inbox."
   [config]
+  (trace "Getting new inbox instance...")
   (let [store (doto (-> (Session/getInstance mail-session-properties)
                         (.getStore "imaps"))
                 (.connect (:imap-domain config)
                           (:username config)
                           (:password config)))]
+    (trace "Connected to store...")
     (let [inbox (.getFolder store (:source-folder config))]
+      (trace "Got folder...")
       ;; create destinations if necessary
-      (doseq [fname ((juxt :reject-folder :done-folder :sent-folder) config)]
+      (doseq [fname ((juxt :reject-folder :done-folder) config)]
         (.create (.getFolder store fname) javax.mail.Folder/HOLDS_MESSAGES))
       (.open inbox Folder/READ_WRITE)
+      (trace "And it's open!")
       inbox)))
 
 (defn close-inbox
@@ -84,7 +88,9 @@
        :lon (* (if (= lons "-") -1 1)
                (Double/parseDouble lonm))}
       (catch NumberFormatException nfe
-        nil))))
+        (info "Failed to parse a number."))
+      (catch org.joda.time.IllegalFieldValueException ifve
+        (info "Invalid date.")))))
 
 (def djia-source-url-format
   "http://geo.crox.net/djia/%s")
@@ -172,8 +178,8 @@ This function will make network calls."
   "Handle message and return destination folder name."
   [m config]
   (if-let [query (extract-query m)]
-    (debug "Received query:" query)
     (let [response (build-reply query m)]
+      (debug "Received query:" query)
       ;; Mark as sent before sending -- if sending fails, we'll notice and
       ;; flag it on the next iteration.
       (.setFlag m FLAG/ANSWERED true)
@@ -190,7 +196,8 @@ This function will make network calls."
     (try
       (debug "Checking for new messages...")
       (let [msgs (.getMessages inbox)]
-        (info "New messages found:" (count msgs))
+        (when-not (zero? (count msgs))
+          (info "New messages found:" (count msgs)))
         (doseq [m msgs
                 ;; Ignore flagged messages -- these need dev attention.
                 :when (not (.isSet m FLAG/FLAGGED))]
@@ -211,7 +218,11 @@ This function will make network calls."
     ;; kick off main loop
     (let [executor (Executors/newScheduledThreadPool 1)]
       (.addShutdownHook (Runtime/getRuntime) (Thread. #(.shutdown executor)))
-      (-> executor (.scheduleWithFixedDelay #(check-messages config)
-                                            0 1 TimeUnit/MINUTES))))
+      (-> executor (.scheduleWithFixedDelay
+                    #(try (check-messages config)
+                          (catch Exception e
+                            (.printStackTrace e)
+                            (throw (RuntimeException. e))))
+                    0 1 TimeUnit/MINUTES))))
   ;; don't print a return value
   nil)
