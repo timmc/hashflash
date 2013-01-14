@@ -215,7 +215,11 @@ This function will make network calls."
   (let [inbox (get-inbox config)]
     (try
       (debug "Checking for new messages...")
-      (let [msgs (.getMessages inbox)]
+      (let [msgs (try
+                   (.getMessages inbox)
+                   (catch javax.mail.MessagingException me
+                     (warn "Could not fetch messages:" (str me))
+                     []))]
         (when @request-reprocess
           (trace "Reprocessing.")
           (doseq [m msgs]
@@ -251,8 +255,7 @@ This function will make network calls."
     (-> executor (.scheduleWithFixedDelay
                   #(try (check-messages config)
                         (catch Exception e
-                          (fatal e "Worker died with exception")
-                          (throw (RuntimeException. e))))
+                          (error e "Worker threw exception, continuing.")))
                   0 1 TimeUnit/MINUTES))))
 
 (defn -main

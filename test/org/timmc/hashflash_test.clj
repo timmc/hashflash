@@ -1,7 +1,10 @@
 (ns org.timmc.hashflash-test
   (:use clojure.test
         org.timmc.hashflash)
+  (:require [taoensso.timbre :as timbre])
   (:import org.joda.time.LocalDate))
+
+(timbre/set-level! :fatal)
 
 (deftest math
   (is (= (double-negative? 0.0) false))
