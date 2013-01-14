@@ -80,7 +80,8 @@
   [s]
   (if-let [[_ y m d lats latm lons lonm] (re-find match-inquiry s)]
     (try
-      {:date (LocalDate. (Long/parseLong y)
+      {:type :geohash
+       :date (LocalDate. (Long/parseLong y)
                          (Long/parseLong m)
                          (Long/parseLong d))
        :lat (* (if (= lats "-") -1 1)

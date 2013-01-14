@@ -40,5 +40,8 @@ DJIA = 12948.96 (from 2012-12-05)")))
 
 (deftest parsing
   (is (= (parse-body " \n 2008-03-2 42, -71.5 stuff")
-         {:date (LocalDate. 2008 3 2) :lat 42.0 :lon -71.0}))
+         {:type :geohash :date (LocalDate. 2008 3 2) :lat 42.0 :lon -71.0}))
+  (testing "Bad date"
+    (is (= (parse-body " \n 2008-99-2 42, -71.5 stuff") nil)))
+  (is (= (parse-body " usage please ")) {:type :usage})
   (is (= (parse-body "hello") nil)))
